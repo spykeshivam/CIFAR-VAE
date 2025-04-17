@@ -19,8 +19,8 @@ This project implements a Convolutional Variational Autoencoder (VAE) to learn l
 
 ```bash
 # Clone the repository
-git clone https://github.com/spykeshivam/convvae-cifar10-animals.git
-cd convvae-cifar10-animals
+git clone https://github.com/spykeshivam/CIFAR-VAE.git
+cd CIFAR-VAE
 
 # Create a virtual environment (optional but recommended)
 python -m venv venv
@@ -56,7 +56,7 @@ To train the model with default parameters:
 ```bash
 python main.py
 ```
-
+If you just want inference from an existing .pt file, run the predict_new() function
 ### Customizing Training
 
 Edit the parameters in `main.py` to customize the training process:
@@ -110,7 +110,6 @@ The VAE is trained with a combined loss:
 
 ### Common Issues
 
-- **CUDA device-side assert triggered**: Ensure input and target values are in the correct range. For binary cross-entropy loss, both should be in [0, 1].
 - **Out of memory errors**: Reduce batch size or model size (hidden dimensions/latent dimension).
 - **Slow convergence**: Adjust learning rate or try a different optimizer.
 
