@@ -1,60 +1,84 @@
 import torch
 from tqdm import tqdm
-from torchvision.transforms import v2
 from torchvision import transforms
-from torch.utils.data import Subset
+from torch.utils.data import Subset, DataLoader
 import torchvision
-from torch.utils.data import DataLoader
+import numpy as np
 from torch.utils.tensorboard import SummaryWriter
-from models.vae import ConvVAE
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 def prepare_data(batch_size=128):
     """
     Prepares a CIFAR-10 dataset filtered to include only 5 animal classes:
     cat (label 3), deer (4), dog (5), frog (6), and horse (7).
-    Images are transformed to float tensors in range [-0.5, 0.5].
+    Images are transformed to float tensors with data augmentation for training.
+    The data augmentation doesn't actually create new persistent samples
+    Your dataset size remains the same (number of original images)
+    But effectively, your model sees different variations of each image across epochs
+    If you have 10,000 original images and train for 25 epochs, the model potentially sees 250,000 unique variations
     """
-    # Define the transforms
-    # In prepare_data function
-    transform = transforms.Compose([
-        transforms.ToTensor(),  # Already gives [0,1] range
+    # Define training transforms with data augmentation
+    train_transform = transforms.Compose([
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(10),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
+        transforms.ToTensor(),
+    ])
+    
+    # Test transform (no augmentation)
+    test_transform = transforms.Compose([
+        transforms.ToTensor(),
     ])
 
-    # Load CIFAR-10 dataset
-    dataset = torchvision.datasets.CIFAR10(
+    # Load CIFAR-10 dataset with augmentation for training
+    train_dataset = torchvision.datasets.CIFAR10(
         root='./data',
         train=True,
         download=True,
-        transform=transform,
+        transform=train_transform,
     )
-
+    
     # Specify the animal classes we want (using the CIFAR-10 class indices)
     # 3: cat, 4: deer, 5: dog, 6: frog, 7: horse
-    target_classes = {3, 4, 5, 6, 7}
+    target_classes = {3, 5}
 
     # Create a subset of indices belonging only to the target classes
-    indices = [i for i, (_, label) in enumerate(dataset) if label in target_classes]
-    animal_dataset = Subset(dataset, indices)
+    train_indices = [i for i, (_, label) in enumerate(train_dataset) if label in target_classes]
+    animal_train_dataset = Subset(train_dataset, train_indices)
     
-    # Create data loader for training
-    train_loader = DataLoader(animal_dataset, batch_size=batch_size, shuffle=True)
+    # Create data loader for training with pin_memory for faster GPU transfer
+    train_loader = DataLoader(
+        animal_train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True,
+        pin_memory=True,
+        num_workers=4,
+        drop_last=True
+    )
     
-    # For testing, we can do the same with the test split
+    # For testing, we use the test split with no augmentation
     test_dataset = torchvision.datasets.CIFAR10(
         root='./data',
         train=False,
         download=True,
-        transform=transform,
+        transform=test_transform,
     )
     test_indices = [i for i, (_, label) in enumerate(test_dataset) if label in target_classes]
     animal_test_dataset = Subset(test_dataset, test_indices)
-    test_loader = DataLoader(animal_test_dataset, batch_size=batch_size, shuffle=False)
-    
+    test_loader = DataLoader(
+        animal_test_dataset, 
+        batch_size=batch_size, 
+        shuffle=False,
+        pin_memory=True,
+        num_workers=4
+    )
+    print(f"Train dataset size: {len(animal_train_dataset)}")
+    print(f"Test dataset size: {len(animal_test_dataset)}")
     return train_loader, test_loader
 
-def train(model, dataloader, optimizer, prev_updates, device, batch_size, writer=None):
+def train(model, dataloader, optimizer, prev_updates, device, batch_size, writer=None, scheduler=None, beta_warmup=None):
     """
-    Trains the ConvVAE model on the given data.
+    Trains the ConvVAE model on the given data with improved training process.
     
     Args:
         model (nn.Module): The ConvVAE model to train.
@@ -64,17 +88,26 @@ def train(model, dataloader, optimizer, prev_updates, device, batch_size, writer
         device (torch.device): Device to train on.
         batch_size (int): Batch size.
         writer (SummaryWriter, optional): TensorBoard writer.
+        scheduler (torch.optim.lr_scheduler, optional): Learning rate scheduler.
+        beta_warmup (callable, optional): Function to calculate beta based on update count.
         
     Returns:
         int: Number of updates.
     """
     model.train()  # Set the model to training mode
+    running_loss = 0.0
+    running_recon_loss = 0.0
+    running_kl_loss = 0.0
     
     for batch_idx, (data, _) in enumerate(tqdm(dataloader, desc="Training")):
         n_upd = prev_updates + batch_idx
         
-        # Move data to device - no need to flatten for ConvVAE
+        # Move data to device
         data = data.to(device)
+        
+        # Apply beta warmup if provided
+        if beta_warmup is not None:
+            model.beta = beta_warmup(n_upd)
         
         optimizer.zero_grad()  # Zero the gradients
         
@@ -83,38 +116,66 @@ def train(model, dataloader, optimizer, prev_updates, device, batch_size, writer
         
         loss.backward()
         
-        if n_upd % 100 == 0:
-            # Calculate and log gradient norms
+        # Gradient clipping to prevent exploding gradients
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+        
+        optimizer.step()  # Update the model parameters
+        
+        # Update running losses
+        running_loss += loss.item()
+        running_recon_loss += output.loss_recon.item()
+        running_kl_loss += output.loss_kl.item()
+        
+        # Log periodically
+        if (batch_idx + 1) % 50 == 0:
+            # Calculate average losses
+            avg_loss = running_loss / 50
+            avg_recon_loss = running_recon_loss / 50
+            avg_kl_loss = running_kl_loss / 50
+            
+            # Calculate gradient norms
             total_norm = 0.0
             for p in model.parameters():
                 if p.grad is not None:
                     param_norm = p.grad.data.norm(2)
                     total_norm += param_norm.item() ** 2
             total_norm = total_norm ** (1. / 2)
-        
-            print(f'Step {n_upd:,} (N samples: {n_upd*batch_size:,}), Loss: {loss.item():.4f} '
-                  f'(Recon: {output.loss_recon.item():.4f}, KL: {output.loss_kl.item():.4f}) '
-                  f'Grad: {total_norm:.4f}')
+            
+            # Reset running losses
+            running_loss = 0.0
+            running_recon_loss = 0.0
+            running_kl_loss = 0.0
+            
+            # Print progress
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f'Step {n_upd:,} (N samples: {n_upd*batch_size:,}), Loss: {avg_loss:.4f} '
+                  f'(Recon: {avg_recon_loss:.4f}, KL: {avg_kl_loss:.4f}) '
+                  f'Grad: {total_norm:.4f}, LR: {current_lr:.6f}, Beta: {model.beta:.4f}')
 
             if writer is not None:
                 global_step = n_upd
-                writer.add_scalar('Loss/Train', loss.item(), global_step)
-                writer.add_scalar('Loss/Train/BCE', output.loss_recon.item(), global_step)
-                writer.add_scalar('Loss/Train/KLD', output.loss_kl.item(), global_step)
-                writer.add_scalar('GradNorm/Train', total_norm, global_step)
+                writer.add_scalar('Loss/Train', avg_loss, global_step)
+                writer.add_scalar('Loss/Train/Reconstruction', avg_recon_loss, global_step)
+                writer.add_scalar('Loss/Train/KLD', avg_kl_loss, global_step)
+                writer.add_scalar('Training/GradNorm', total_norm, global_step)
+                writer.add_scalar('Training/LearningRate', current_lr, global_step)
+                writer.add_scalar('Training/Beta', model.beta, global_step)
                 
-                # Log a few reconstructed images periodically
-                if n_upd % 500 == 0:
-                    recon_images = (output.x_recon + 0.5).clamp(0, 1)  # Convert back to [0,1] range
-                    orig_images = (data + 0.5).clamp(0, 1)
+                # Log images periodically
+                if (batch_idx + 1) % 200 == 0:
+                    recon_images = output.x_recon.clamp(0, 1)
+                    orig_images = data.clamp(0, 1)
                     writer.add_images('Train/Reconstructions', recon_images[:8], global_step)
                     writer.add_images('Train/Originals', orig_images[:8], global_step)
+    
+    # Update learning rate if scheduler is provided
+    if scheduler is not None:
+        if isinstance(scheduler, ReduceLROnPlateau):
+            # This type of scheduler needs the validation loss
+            pass  # We'll update it after validation in the main loop
+        else:
+            scheduler.step()
             
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)    
-        
-        optimizer.step()  # Update the model parameters
-        
     return prev_updates + len(dataloader)
 
 
@@ -128,6 +189,9 @@ def test(model, dataloader, cur_step, device, writer=None):
         cur_step (int): The current step.
         device (torch.device): Device to test on.
         writer (SummaryWriter, optional): TensorBoard writer.
+        
+    Returns:
+        float: Average test loss.
     """
     model.eval()  # Set the model to evaluation mode
     test_loss = 0
@@ -147,14 +211,14 @@ def test(model, dataloader, cur_step, device, writer=None):
     test_loss /= len(dataloader)
     test_recon_loss /= len(dataloader)
     test_kl_loss /= len(dataloader)
-    print(f'====> Test set loss: {test_loss:.4f} (BCE: {test_recon_loss:.4f}, KLD: {test_kl_loss:.4f})')
+    print(f'====> Test set loss: {test_loss:.4f} (Recon: {test_recon_loss:.4f}, KLD: {test_kl_loss:.4f})')
     
     if writer is not None:
         writer.add_scalar('Loss/Test', test_loss, global_step=cur_step)
-        writer.add_scalar('Loss/Test/BCE', test_recon_loss, global_step=cur_step)
+        writer.add_scalar('Loss/Test/Reconstruction', test_recon_loss, global_step=cur_step)
         writer.add_scalar('Loss/Test/KLD', test_kl_loss, global_step=cur_step)
         
-        # Log reconstructions
+        # Log reconstructions and samples
         with torch.no_grad():
             # Get a batch of test data for visualization
             test_batch, _ = next(iter(dataloader))
@@ -162,70 +226,53 @@ def test(model, dataloader, cur_step, device, writer=None):
             
             # Generate reconstructions
             recon_output = model(test_batch)
-            recon_images = (recon_output.x_recon + 0.5).clamp(0, 1)
-            orig_images = (test_batch + 0.5).clamp(0, 1)
+            recon_images = recon_output.x_recon.clamp(0, 1)
+            orig_images = test_batch.clamp(0, 1)
             
             writer.add_images('Test/Reconstructions', recon_images[:16], global_step=cur_step)
             writer.add_images('Test/Originals', orig_images[:16], global_step=cur_step)
             
             # Log random samples from the latent space
             samples = model.sample(16, device)
-            sample_images = (samples + 0.5).clamp(0, 1)
+            sample_images = samples.clamp(0, 1)
             writer.add_images('Test/Samples', sample_images, global_step=cur_step)
+            
+            # Log latent space interpolations (between random samples)
+            if test_batch.size(0) >= 2:
+                # Encode two random images
+                mu1, logvar1 = model.encode(test_batch[0:1])
+                mu2, logvar2 = model.encode(test_batch[1:2])
+                
+                # Create interpolation steps
+                steps = 8
+                z1 = model.reparameterize(mu1, logvar1)
+                z2 = model.reparameterize(mu2, logvar2)
+                
+                # Interpolate in latent space
+                z_interp = torch.zeros(steps, model.latent_dim, device=device)
+                for i in range(steps):
+                    alpha = i / (steps - 1)
+                    z_interp[i] = (1 - alpha) * z1 + alpha * z2
+                
+                # Decode interpolated points
+                interp_images = model.decode(z_interp)
+                writer.add_images('Test/Interpolations', interp_images.clamp(0, 1), global_step=cur_step)
+    
+    return test_loss
 
-# Main training function
-def train_vae(epochs=50, batch_size=128, learning_rate=1e-3):
+
+def create_beta_warmup_fn(warmup_steps=1000, max_beta=1.0):
     """
-    Main function to train the ConvVAE model.
+    Creates a beta warmup function for annealing the KL term weight.
     
     Args:
-        epochs (int): Number of epochs to train for.
-        batch_size (int): Batch size for training.
-        learning_rate (float): Learning rate for optimizer.
+        warmup_steps (int): Number of steps to reach max_beta.
+        max_beta (float): Maximum value of beta.
+        
+    Returns:
+        callable: Function to calculate beta based on update count.
     """
-    # Set device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    def beta_warmup_fn(step):
+        return min(max_beta, step / warmup_steps * max_beta)
     
-    # Prepare data
-    train_loader, test_loader = prepare_data(batch_size=batch_size)
-    
-    # CIFAR-10 images are 3x32x32
-    model = ConvVAE(
-        in_channels=3,
-        img_size=32,
-        hidden_dims=[32, 64, 128, 256],
-        latent_dim=128
-    ).to(device)
-    
-    # Set up optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    
-    # Set up TensorBoard writer
-    writer = SummaryWriter(log_dir='runs/convvae_cifar10_animals')
-    
-    # Initialize updates counter
-    updates = 0
-    
-    # Training loop
-    for epoch in range(1, epochs + 1):
-        print(f"Epoch {epoch}/{epochs}")
-        
-        # Train
-        updates = train(model, train_loader, optimizer, updates, device, batch_size, writer)
-        
-        # Test
-        test(model, test_loader, updates, device, writer)
-        
-        # Save model checkpoint
-        torch.save({
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'updates': updates,
-            'epoch': epoch,
-        }, f'checkpoints/convvae_epoch_{epoch}.pt')
-    
-    writer.close()
-    print("Training complete!")
-    
-    return model
+    return beta_warmup_fn

@@ -111,10 +111,10 @@ def interpolate_latent_space(model, dataloader, device, n_interp=10):
         interp_images = model.decode(z_interp)
         
         # Convert to displayable format
-        interp_images = (interp_images + 0.5).clamp(0, 1)
+        interp_images = (interp_images).clamp(0, 1)
         
         # Also get the original images
-        orig_images = (data_batch[:2] + 0.5).clamp(0, 1)
+        orig_images = (data_batch[:2]).clamp(0, 1)
 
     # Plot the original and interpolated images
     plt.figure(figsize=(12, 4))
@@ -143,11 +143,11 @@ def interpolate_latent_space(model, dataloader, device, n_interp=10):
     plt.close()
     
     # Grid of random samples
-    n_grid = 6
+    n_grid = 3
     with torch.no_grad():
         z = torch.randn(n_grid * n_grid, model.latent_dim).to(device)
         samples = model.decode(z)
-        samples = (samples + 0.5).clamp(0, 1)
+        samples = (samples).clamp(0, 1)
     
     # Create grid of images
     grid = torchvision.utils.make_grid(samples, nrow=n_grid, padding=2)
@@ -159,29 +159,34 @@ def interpolate_latent_space(model, dataloader, device, n_interp=10):
     plt.close()
 
 
-def predict_new(
-    model_path: str = 'convvae_cifar_animals_64d.pt',
-    num_samples: int = 25,
-    in_channels: int = 3,
-    img_size: int = 32,
-    hidden_dims = [32, 64, 128, 256],
-    latent_dim: int = 64,
-):
+def predict_new(hidden_dims,latent_dim,model_path='convvae_cifar_animals_256d.pt', n_grid=3, device=None):
     """
-    Generate new images using the trained ConvVAE model.
+    Load a pretrained ConvVAE model and generate random images from the latent space.
     
     Args:
-        model_path (str): Path to the saved model.
-        num_samples (int): Number of images to generate.
-        in_channels (int): Number of input channels.
-        img_size (int): Size of the input images.
-        hidden_dims (list): List of hidden dimensions for the convolutional layers.
-        latent_dim (int): Dimensionality of the latent space.
+        model_path (str): Path to the saved model weights file
+        n_grid (int): Grid size for visualization (n_grid × n_grid images)
+        device: Device to run inference on. If None, will use CUDA if available.
+        
+    Returns:
+        None (saves the generated image grid to disk)
     """
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    import torch
+    import torchvision
+    import matplotlib.pyplot as plt
+    
+    # Set device
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-
-    # Create model with the same architecture as during training
+    
+    # Define model hyperparameters (must match the trained model)
+    in_channels = 3
+    img_size = 32
+    hidden_dims = hidden_dims
+    latent_dim = latent_dim  # This should match the value used in training
+    
+    # Initialize model with the same architecture as during training
     model = ConvVAE(
         in_channels=in_channels,
         img_size=img_size,
@@ -189,30 +194,48 @@ def predict_new(
         latent_dim=latent_dim
     ).to(device)
     
-    # Load trained weights
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    # Load the saved weights
+    try:
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        print(f"Model loaded successfully from {model_path}")
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        return
+    
+    # Set model to evaluation mode
     model.eval()
-    print(f"Loaded model from {model_path}")
-
-    # Generate samples using the model's sample method
+    
+    # Generate random samples from the latent space
     with torch.no_grad():
-        samples = model.sample(num_samples, device)
-        # Convert to displayable format
-        samples = (samples + 0.5).clamp(0, 1)
-
-    # Display and save
-    nrow = int(np.sqrt(num_samples))
-    grid = torchvision.utils.make_grid(samples, nrow=nrow, padding=2)
+        # Create random latent vectors
+        z = torch.randn(n_grid * n_grid, model.latent_dim).to(device)
+        
+        # Decode the latent vectors to generate images
+        samples = model.decode(z)
+        
+        # Adjust pixel values to [0, 1] range
+        # Note: This assumes your model outputs are normalized to [-0.5, 0.5] range
+        samples = (samples).clamp(0, 1)
+    
+    # Create grid of images
+    grid = torchvision.utils.make_grid(samples, nrow=n_grid, padding=2)
+    
+    # Visualize and save the grid
     plt.figure(figsize=(10, 10))
     plt.imshow(grid.permute(1, 2, 0).cpu().numpy())
+    plt.title("Random Samples from Latent Space")
     plt.axis('off')
-    plt.title(f"Generated CIFAR-10 Animal Images")
-    plt.savefig('convvae_cifar_generated.png')
-    plt.show()
     
-    return samples
+    # Save the figure
+    plt.show()
+    output_path = 'convvae_cifar_random_samples3.png'
+    plt.savefig(output_path)
+    plt.close()
+    print(f"Generated images saved to {output_path}")
+    
+    return grid  # Return the grid tensor in case it's needed for further processing
 
-
+'''
 def latent_space_exploration(
     model_path: str = 'convvae_cifar_animals_64d.pt',
     in_channels: int = 3,
@@ -281,3 +304,4 @@ def latent_space_exploration(
     plt.tight_layout()
     plt.savefig('convvae_cifar_latent_traversal.png')
     plt.show()
+'''
